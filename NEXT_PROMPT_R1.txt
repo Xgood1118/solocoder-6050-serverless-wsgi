@@ -1,0 +1,5 @@
+重放功能不对。`--replay` 调了 handle_request 但把返回的响应结果直接扔了,比对的是重播结果和自己录的原始数据,不是实际服务和录制间的差异——等于重放跑了个寂寞,状态码比对没意义。另外录制时并发请求多了会撞文件名,RecordingMiddleware 的计数没加锁。检查修复一下。
+
+超时机制也有问题。在 Linux 上 SIGALRM 和 threading.Timer 会同时装两套,其中 Timer 那个 raise 在非主线程被静默吞掉,Windows 下靠 Timer 兜底等于没有超时。检查修复一下。
+
+回放的缓存命中计数不对,`len(cache)` 算的是唯一 key 数不是命中次数,读起来是错的。检查修复一下。

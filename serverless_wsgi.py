@@ -8,11 +8,15 @@ Inspired by: https://github.com/miserlou/zappa
 Author: Logan Raarup <logan@logan.dk>
 """
 import base64
+import hashlib
 import io
 import json
+import logging
 import os
 import sys
-from urllib.parse import urlencode, unquote, unquote_plus
+import time
+import uuid
+from urllib.parse import urlencode, unquote, unquote_plus, urlparse
 
 from werkzeug.datastructures import Headers, iter_multi_items
 from werkzeug.http import HTTP_STATUS_CODES
@@ -27,6 +31,83 @@ TEXT_MIME_TYPES = [
     "application/vnd.api+json",
     "image/svg+xml",
 ]
+
+DEFAULT_BINARY_S3_THRESHOLD_BYTES = 5 * 1024 * 1024
+DEFAULT_BINARY_S3_PRESIGN_TTL = 3600
+S3_BODY_SIGNED_URL_HEADER = "X-S3-Body-Signed-Url"
+S3_BODY_BUCKET_HEADER = "X-S3-Body-Bucket"
+S3_BODY_KEY_HEADER = "X-S3-Body-Key"
+
+
+def _get_s3_config():
+    bucket = os.environ.get("RESPONSE_BINARY_S3_BUCKET", "")
+    threshold_str = os.environ.get(
+        "RESPONSE_BINARY_S3_THRESHOLD_BYTES", str(DEFAULT_BINARY_S3_THRESHOLD_BYTES)
+    )
+    try:
+        threshold = int(threshold_str)
+    except ValueError:
+        threshold = DEFAULT_BINARY_S3_THRESHOLD_BYTES
+    prefix = os.environ.get("RESPONSE_BINARY_S3_PREFIX", "wsgi-responses/")
+    ttl_str = os.environ.get(
+        "RESPONSE_BINARY_S3_PRESIGN_TTL", str(DEFAULT_BINARY_S3_PRESIGN_TTL)
+    )
+    try:
+        ttl = int(ttl_str)
+    except ValueError:
+        ttl = DEFAULT_BINARY_S3_PRESIGN_TTL
+    return bucket, threshold, prefix, ttl
+
+
+def _upload_body_to_s3(body_bytes, content_type):
+    bucket, threshold, prefix, ttl = _get_s3_config()
+    if not bucket:
+        return None, None, None
+    if len(body_bytes) < threshold:
+        return None, None, None
+
+    try:
+        import boto3
+    except ImportError:
+        logging.warning(
+            "boto3 not available, skipping S3 upload for large binary response"
+        )
+        return None, None, None
+
+    s3 = boto3.client("s3")
+    content_hash = hashlib.sha256(body_bytes).hexdigest()[:16]
+    key = "{}{}-{}-{}".format(
+        prefix,
+        int(time.time()),
+        content_hash,
+        uuid.uuid4().hex[:8],
+    )
+
+    extra_args = {}
+    if content_type:
+        extra_args["ContentType"] = content_type
+
+    try:
+        s3.put_object(Bucket=bucket, Key=key, Body=body_bytes, **extra_args)
+        signed_url = s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": bucket, "Key": key},
+            ExpiresIn=ttl,
+        )
+        return bucket, key, signed_url
+    except Exception as e:
+        logging.warning("Failed to upload large binary response to S3: %s", e)
+        return None, None, None
+
+
+def _is_binary_content(mimetype):
+    if not mimetype:
+        return False
+    if mimetype.startswith("text/"):
+        return False
+    if mimetype in TEXT_MIME_TYPES:
+        return False
+    return True
 
 
 def all_casings(input_string):
@@ -135,30 +216,54 @@ def setup_environ_items(environ, headers):
 
 def generate_response(response, event):
     returndict = {"statusCode": response.status_code}
-
-    if "multiValueHeaders" in event and event["multiValueHeaders"]:
-        returndict["multiValueHeaders"] = group_headers(response.headers)
-    else:
-        returndict["headers"] = split_headers(response.headers)
-
-    if is_alb_event(event):
-        # If the request comes from ALB we need to add a status description
-        returndict["statusDescription"] = "%d %s" % (
-            response.status_code,
-            HTTP_STATUS_CODES[response.status_code],
-        )
+    response_headers = Headers(response.headers)
 
     if response.data:
         mimetype = response.mimetype or "text/plain"
-        if (
-                mimetype.startswith("text/") or mimetype in TEXT_MIME_TYPES
+        is_binary = _is_binary_content(mimetype) and not response.headers.get(
+            "Content-Encoding", ""
+        )
+
+        if is_binary:
+            bucket, key, signed_url = _upload_body_to_s3(
+                response.data, mimetype
+            )
+            if bucket and key and signed_url:
+                response_headers[S3_BODY_BUCKET_HEADER] = bucket
+                response_headers[S3_BODY_KEY_HEADER] = key
+                response_headers[S3_BODY_SIGNED_URL_HEADER] = signed_url
+                returndict["body"] = (
+                    "Response body uploaded to S3, see header "
+                    + S3_BODY_SIGNED_URL_HEADER
+                    + " for download URL"
+                )
+                returndict["isBase64Encoded"] = False
+            else:
+                returndict["body"] = base64.b64encode(
+                    response.data
+                ).decode("utf-8")
+                returndict["isBase64Encoded"] = True
+        elif (
+            mimetype.startswith("text/") or mimetype in TEXT_MIME_TYPES
         ) and not response.headers.get("Content-Encoding", ""):
             returndict["body"] = response.get_data(as_text=True)
             returndict["isBase64Encoded"] = False
         else:
             returndict["body"] = base64.b64encode(
-                response.data).decode("utf-8")
+                response.data
+            ).decode("utf-8")
             returndict["isBase64Encoded"] = True
+
+    if "multiValueHeaders" in event and event["multiValueHeaders"]:
+        returndict["multiValueHeaders"] = group_headers(response_headers)
+    else:
+        returndict["headers"] = split_headers(response_headers)
+
+    if is_alb_event(event):
+        returndict["statusDescription"] = "%d %s" % (
+            response.status_code,
+            HTTP_STATUS_CODES[response.status_code],
+        )
 
     return returndict
 

@@ -57,6 +57,21 @@ class ServerlessWSGI {
         }
 
         this.pipArgs = this.serverless.service.custom.wsgi.pipArgs;
+
+        if (_.isArray(this.serverless.service.custom.wsgi.extraIndexUrls)) {
+          this.extraIndexUrls = this.serverless.service.custom.wsgi.extraIndexUrls;
+        } else {
+          this.extraIndexUrls = [];
+        }
+
+        if (_.isBoolean(this.serverless.service.custom.wsgi.strictLock)) {
+          this.strictLock = this.serverless.service.custom.wsgi.strictLock;
+        } else {
+          this.strictLock = false;
+        }
+      } else {
+        this.extraIndexUrls = [];
+        this.strictLock = false;
       }
 
       if (this.enableRequirements) {
@@ -211,6 +226,23 @@ class ServerlessWSGI {
         args.push(this.pipArgs);
       }
 
+      if (this.extraIndexUrls) {
+        _.each(this.extraIndexUrls, (url) => {
+          args.push("--extra-index-url");
+          args.push(url);
+        });
+      }
+
+      const isCI =
+        this.strictLock ||
+        process.env.CI === "true" ||
+        process.env.GITHUB_ACTIONS === "true" ||
+        process.env.GITLAB_CI === "true" ||
+        process.env.JENKINS_URL !== undefined;
+      if (isCI) {
+        args.push("--ci");
+      }
+
       if (this.wsgiApp) {
         args.push(path.resolve(__dirname, "requirements.txt"));
       }
@@ -243,7 +275,7 @@ class ServerlessWSGI {
       }
 
       if (res.status != 0) {
-        return reject(res.stderr);
+        return reject(res.stderr || res.stdout);
       }
 
       resolve();
@@ -387,6 +419,8 @@ class ServerlessWSGI {
       const ssl = this.options.ssl || false;
       const ssl_pub = this.options["ssl-pub"] || "";
       const ssl_pri = this.options["ssl-pri"] || "";
+      const record = this.options.record || "";
+      const replay = this.options.replay || "";
 
       var args = [
         path.resolve(__dirname, "serve.py"),
@@ -414,6 +448,14 @@ class ServerlessWSGI {
 
       if (ssl_pri) {
         args.push("--ssl-pri", ssl_pri);
+      }
+
+      if (record) {
+        args.push("--record", record);
+      }
+
+      if (replay) {
+        args.push("--replay", replay);
       }
 
       var status = child_process.spawnSync(this.pythonBin, args, {
@@ -464,22 +506,24 @@ class ServerlessWSGI {
       );
     }
 
-    // We're going to call the provider-agnostic invoke plugin, which has
-    // no proper plugin-facing API. Instead, the current CLI options are modified
-    // to match those of an invoke call.
+    const payload = {
+      command: command,
+      data: data,
+    };
+    if (this.options.timeout) {
+      payload.timeout = parseInt(this.options.timeout, 10);
+    }
+    if (this.options["max-output"]) {
+      payload["max-output"] = parseInt(this.options["max-output"], 10);
+    }
+
     this.serverless.pluginManager.cliOptions.function = handlerFunction;
     this.options.function = handlerFunction;
     this.options.data = JSON.stringify({
-      "_serverless-wsgi": {
-        command: command,
-        data: data,
-      },
+      "_serverless-wsgi": payload,
     });
     this.serverless.pluginManager.cliOptions.data = JSON.stringify({
-      "_serverless-wsgi": {
-        command: command,
-        data: data,
-      },
+      "_serverless-wsgi": payload,
     });
 
     this.serverless.pluginManager.cliOptions.context = undefined;
@@ -530,15 +574,20 @@ class ServerlessWSGI {
             } catch (e) {
               // Swallow exception
             }
-            if (_.isArray(output) && output.length == 2) {
+            if (_.isArray(output) && (output.length == 2 || output.length == 3)) {
               const return_code = output[0];
               const output_data = _.isString(output[1])
                 ? _.trimEnd(output[1], "\n")
                 : output[1];
+              const meta = output.length == 3 ? output[2] : {};
+              let prefix = "";
+              if (meta && meta.timedOut) {
+                prefix = "[execution timed out, partial output follows]\n";
+              }
               if (return_code == 0) {
-                this.serverless.cli.log(output_data);
+                this.serverless.cli.log(prefix + output_data);
               } else {
-                return reject(new this.serverless.classes.Error(output_data));
+                return reject(new this.serverless.classes.Error(prefix + output_data));
               }
             } else {
               this.serverless.cli.log(output);
@@ -635,6 +684,14 @@ class ServerlessWSGI {
                 type: "string",
                 usage: "local ssl pem file to use for ssl private key",
               },
+              record: {
+                type: "string",
+                usage: "Directory to record request/response as messagepack files",
+              },
+              replay: {
+                type: "string",
+                usage: "Directory containing messagepack recordings to replay (skips network listening)",
+              },
             },
           },
           install: {
@@ -658,6 +715,14 @@ class ServerlessWSGI {
                 type: "string",
                 usage: "Path to a shell script to execute",
                 shortcut: "f",
+              },
+              timeout: {
+                type: "string",
+                usage: "Timeout in seconds (overrides default of 120s)",
+              },
+              "max-output": {
+                type: "string",
+                usage: "Maximum output bytes (overrides default of 5MB)",
               },
             },
             commands: {
@@ -693,6 +758,14 @@ class ServerlessWSGI {
                 usage: "Path to a Python script to execute",
                 shortcut: "f",
               },
+              timeout: {
+                type: "string",
+                usage: "Timeout in seconds (overrides default of 30s)",
+              },
+              "max-output": {
+                type: "string",
+                usage: "Maximum output bytes (overrides default of 5MB)",
+              },
             },
             commands: {
               local: {
@@ -723,6 +796,14 @@ class ServerlessWSGI {
                 shortcut: "c",
                 required: true,
               },
+              timeout: {
+                type: "string",
+                usage: "Timeout in seconds (overrides default of 60s)",
+              },
+              "max-output": {
+                type: "string",
+                usage: "Maximum output bytes (overrides default of 5MB)",
+              },
             },
             commands: {
               local: {
@@ -748,6 +829,14 @@ class ServerlessWSGI {
                 usage: "Flask CLI command",
                 shortcut: "c",
                 required: true,
+              },
+              timeout: {
+                type: "string",
+                usage: "Timeout in seconds (overrides default of 60s)",
+              },
+              "max-output": {
+                type: "string",
+                usage: "Maximum output bytes (overrides default of 5MB)",
               },
             },
             commands: {
