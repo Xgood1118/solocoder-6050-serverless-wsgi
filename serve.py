@@ -13,7 +13,9 @@ import io
 import json
 import os
 import sys
+import threading
 import time
+import uuid
 from urllib.parse import urlencode
 
 try:
@@ -105,7 +107,6 @@ class RecordingMiddleware:
         self.app = app
         self.record_dir = record_dir
         os.makedirs(record_dir, exist_ok=True)
-        self._counter = 0
 
     def __call__(self, environ, start_response):
         request = Request(environ)
@@ -131,8 +132,8 @@ class RecordingMiddleware:
         }
 
         safe_ts = str(int(record["timestamp"] * 1e6))
-        self._counter += 1
-        filename = "req-{}-{}.msgpack".format(safe_ts, self._counter)
+        file_id = uuid.uuid4().hex[:12]
+        filename = "req-{}-{}.msgpack".format(safe_ts, file_id)
         filepath = os.path.join(self.record_dir, filename)
 
         _require_msgpack()
@@ -175,6 +176,46 @@ def _response_from_recorded(recorded_response):
     return response
 
 
+def _response_data_from_handle_result(ret):
+    if not isinstance(ret, dict):
+        return {
+            "status_code": 0,
+            "headers": [],
+            "data": b"",
+            "mimetype": "",
+        }
+    status_code = ret.get("statusCode", 200)
+    is_base64 = ret.get("isBase64Encoded", False)
+    body = ret.get("body", "")
+    if is_base64:
+        import base64
+        try:
+            data = base64.b64decode(body)
+        except Exception:
+            data = body.encode("utf-8", errors="replace")
+    else:
+        data = body.encode("utf-8", errors="replace")
+    headers = []
+    if "multiValueHeaders" in ret and ret["multiValueHeaders"]:
+        for key, values in ret["multiValueHeaders"].items():
+            for v in values:
+                headers.append([key, v])
+    elif "headers" in ret and ret["headers"]:
+        for key, value in ret["headers"].items():
+            headers.append([key, value])
+    mimetype = ""
+    for h in headers:
+        if h[0].lower() == "content-type":
+            mimetype = h[1].split(";")[0].strip()
+            break
+    return {
+        "status_code": status_code,
+        "headers": headers,
+        "data": data,
+        "mimetype": mimetype,
+    }
+
+
 def run_replay(app, replay_dir):
     records = _load_recordings(replay_dir)
     if not records:
@@ -182,22 +223,32 @@ def run_replay(app, replay_dir):
         return
 
     cache = {}
-    for rec in records:
+    cache_hits = 0
+    status_mismatches = 0
+    for idx, rec in enumerate(records):
         event = rec.get("event", {})
         context = rec.get("context", {})
         qs_hash = _query_string_hash(event)
+        recorded_resp = rec.get("response", {})
 
         if qs_hash in cache:
+            cache_hits += 1
+            actual_resp = cache[qs_hash]
             sys.stdout.write(
-                "[replay cache-hit qs={}] {}\n".format(
-                    qs_hash[:12], event.get("rawPath", "/")
+                "[replay #{}/{} cache-hit qs={}] {}\n".format(
+                    idx + 1,
+                    len(records),
+                    qs_hash[:12],
+                    event.get("rawPath", "/"),
                 )
             )
-            recorded_resp = cache[qs_hash]
         else:
             sys.stdout.write(
-                "[replay invoke qs={}] {}\n".format(
-                    qs_hash[:12], event.get("rawPath", "/")
+                "[replay #{}/{} invoke qs={}] {}\n".format(
+                    idx + 1,
+                    len(records),
+                    qs_hash[:12],
+                    event.get("rawPath", "/"),
                 )
             )
             try:
@@ -209,13 +260,13 @@ def run_replay(app, replay_dir):
                     )
                 )
                 continue
-            recorded_resp = rec.get("response")
-            cache[qs_hash] = recorded_resp
+            actual_resp = _response_data_from_handle_result(ret)
+            cache[qs_hash] = actual_resp
 
-        expected = rec.get("response", {})
-        expected_status = expected.get("status_code")
-        actual_status = recorded_resp.get("status_code")
-        if expected_status and expected_status != actual_status:
+        expected_status = recorded_resp.get("status_code")
+        actual_status = actual_resp.get("status_code")
+        if expected_status is not None and expected_status != actual_status:
+            status_mismatches += 1
             sys.stderr.write(
                 "[replay status-mismatch] expected {} got {} for {}\n".format(
                     expected_status, actual_status, event.get("rawPath", "/")
@@ -223,8 +274,8 @@ def run_replay(app, replay_dir):
             )
 
     sys.stdout.write(
-        "Replay complete: {} requests, {} cache hits\n".format(
-            len(records), len(cache)
+        "Replay complete: {} requests, {} cache hits, {} status mismatches\n".format(
+            len(records), cache_hits, status_mismatches
         )
     )
 

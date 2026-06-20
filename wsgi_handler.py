@@ -98,11 +98,6 @@ def _install_timeout(seconds):
             return ("sigalrm", old_handler)
         except (ValueError, OSError):
             pass
-    if threading.current_thread() is threading.main_thread():
-        timer = threading.Timer(seconds, lambda: _timeout_handler(None, None))
-        timer.daemon = True
-        timer.start()
-        return ("timer", timer)
     return None
 
 
@@ -115,11 +110,6 @@ def _restore_timeout(handle):
             signal.alarm(0)
             signal.signal(signal.SIGALRM, handle[1])
         except (ValueError, OSError):
-            pass
-    elif mode == "timer":
-        try:
-            handle[1].cancel()
-        except Exception:
             pass
 
 
